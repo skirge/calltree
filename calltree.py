@@ -297,6 +297,9 @@ class CallTreeLayout(QVBoxLayout):
                             count += 1
 
     def update_widget(self, cur_func: Function):
+        if not self.treeview.isVisible():
+            return
+        
         # Clear previous calls
         self.clear()
         call_root_node = self.model.invisibleRootItem()

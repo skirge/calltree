@@ -19,7 +19,8 @@ from PySide6.QtWidgets import (
 )
 from binaryninja.settings import Settings
 
-from binaryninja import BinaryView, Function
+from binaryninja import BinaryView, Function, MediumLevelILOperation, SymbolType
+from binaryninja.types import CoreSymbol
 
 from .demangle import demangle_name
 
@@ -89,7 +90,10 @@ class CurrentFunctionNameLayout(QHBoxLayout):
             self.cur_func_text.toPlainText()
         )[0]
         # make sure that sidebar is updated
-        self._binary_view.navigate(self._binary_view.view, cur_func.start)
+        if type(cur_func) == CoreSymbol:
+            self._binary_view.navigate(self._binary_view.view, cur_func.address)
+        else:
+            self._binary_view.navigate(self._binary_view.view, cur_func.start)
 
 
 # Layout with search bar and expand/collapse buttons
@@ -241,8 +245,12 @@ class CallTreeLayout(QVBoxLayout):
             caller, callee = parent_func, item.func
 
         for ref in caller.call_sites:
-            if callee.start in bv.get_callees(ref.address, ref.function):
-                break
+            if type(callee) == CoreSymbol:
+                if callee.address in bv.get_callees(ref.address, ref.function):
+                    break
+            else:
+                if callee.start in bv.get_callees(ref.address, ref.function):
+                    break
         else:
             # callee not found in callers
             return
@@ -254,7 +262,10 @@ class CallTreeLayout(QVBoxLayout):
         cur_func = self.model.itemFromIndex(self.proxy_model.mapToSource(index)).func
         # make sure that sidebar is updated
         self._skip_update = False
-        self._binary_view.navigate(self._binary_view.view, cur_func.start)
+        if type(cur_func) == CoreSymbol:
+            self._binary_view.navigate(self._binary_view.view, cur_func.address)
+        else:
+            self._binary_view.navigate(self._binary_view.view, cur_func.start)
 
     def filter_blacklisted(self, flist):
         return list(filter(lambda x: x.name not in self._blacklisted, flist))
@@ -270,11 +281,53 @@ class CallTreeLayout(QVBoxLayout):
             if re.search(p, fname):
                 return True
         return False
+
+    def get_callees(self, func):
+        for site in func.call_sites:
+            if site.mlil.operation == MediumLevelILOperation.MLIL_CALL:
+                # print(f"site = 0x{site.address:0x}")
+                if site.mlil.dest.operation == MediumLevelILOperation.MLIL_IMPORT:
+                    s = self._binary_view.get_symbol_at(site.mlil.dest.value.value)
+                    if s:
+                        yield s
+                elif site.mlil.dest.operation == MediumLevelILOperation.MLIL_CONST_PTR:
+                    f = self._binary_view.get_function_at(site.mlil.dest.value.value)
+                    if f:
+                        yield f
+                    else:
+                        # can be a symbol to __builtin_*
+                        s = self._binary_view.get_symbol_at(site.mlil.dest.value.value)
+                        if s:
+                            yield s
+                elif site.mlil.dest.operation in [MediumLevelILOperation.MLIL_VAR, MediumLevelILOperation.MLIL_LOAD]:
+                    # addresses from devi
+                    code_refs = self._binary_view.get_code_refs_from(site.address)
+                    for code_ref in code_refs:
+                        # print(hex(code_ref))
+                        f =  self._binary_view.get_function_at(code_ref)
+                        if f:
+                            yield f
+                else:
+                    print(f"[-] calltree: unknown op at 0x{site.address:0x}")
+
     def set_func_calls(self, cur_func, cur_std_item, is_caller: bool, depth=0):
+        if type(cur_func) != CoreSymbol:
+            func_symbol = cur_func.symbol
+        else:
+            func_symbol = cur_func
+        if func_symbol is None:
+            # print(f"no symbol for function {cur_func}")
+            return
+        if func_symbol.type == SymbolType.SymbolicFunctionSymbol:
+            return
+        if func_symbol.type == SymbolType.ImportAddressSymbol:
+            return
+        if func_symbol.type == SymbolType.LibraryFunctionSymbol:
+            return
         if is_caller:
             cur_func_calls = list(set(cur_func.callers))
         else:
-            cur_func_calls = list(set(cur_func.callees))
+            cur_func_calls = self.get_callees(cur_func)
 
         if not self.is_hard_blacklisted(cur_func.name):
             if depth < self._func_depth:
@@ -309,7 +362,7 @@ class CallTreeLayout(QVBoxLayout):
         if self.is_caller:
             cur_func_calls = list(set(cur_func.callers))
         else:
-            cur_func_calls = list(set(cur_func.callees))
+            cur_func_calls = self.get_callees(cur_func)
 
         root_std_items = []
 

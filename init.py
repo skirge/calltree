@@ -81,7 +81,7 @@ Settings().register_setting(
         "title" : "Blacklisted functions - won't appear in callees tab",
         "type" : "array",
         "elementType" : "string",
-        "default" : [\"_LOG_.*\", \".*printf.*\", \".*stack_chk_fail\", "_ERR_.*", "log_function.*","debug_log.*"],
+        "default" : [\".*chkstk\",\"_CRYPTO.*\",\"_LOG_.*\", \".*printf.*\", \".*stack_chk_fail\", \"_ERR_.*\", \"log_function.*\",\"debug_log.*\",\".*invalid_parameter.*\", \".*security_check_cookie.*\", \".*assert_fail.*\"],
         "description" : "List of functions which will be not expanded",
         "ignore" : ["SettingsProjectScope", "SettingsResourceScope"]
     }
@@ -95,7 +95,7 @@ Settings().register_setting(
         "title" : "Hard blacklisted functions",
         "type" : "array",
         "elementType" : "string",
-        "default" : [\".*stack_chk_fail\"],
+        "default" : [\".*chkstk\",\"_CRYPTO.*\",\"_LOG_.*\", \".*printf.*\", \".*stack_chk_fail\", \"_ERR_.*\", \"log_function.*\",\"debug_log.*\",\".*invalid_parameter.*\", \".*security_check_cookie.*\", \".*assert_fail.*\"],
         "description" : "List of functions which will be not processed at all",
         "ignore" : ["SettingsProjectScope", "SettingsResourceScope"]
     }

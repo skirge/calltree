@@ -102,6 +102,20 @@ Settings().register_setting(
     """,
 )
 
+Settings().register_setting(
+    "calltree.sinks",
+    """
+    {
+        "title" : "Dangerous sink functions - highlighted in the tree",
+        "type" : "array",
+        "elementType" : "string",
+        "default" : [\".*strcpy\", \".*strcat\", \".*strncpy\", \".*strncat\", \".*sprintf\", \".*vsprintf\", \".*gets\", \".*scanf\", \".*memcpy\", \".*memmove\", \".*alloca\", \".*system\", \".*popen\", \".*exec.*\", \".*malloc\", \".*realloc\", \".*free\"],
+        "description" : "Regexes for dangerous sinks; matching nodes are highlighted to flag potential bug candidates",
+        "ignore" : ["SettingsProjectScope", "SettingsResourceScope"]
+    }
+    """,
+)
+
 
 class ScrollLabel(QScrollArea):
     # constructor
@@ -202,6 +216,7 @@ class CalltreeSidebarWidget(SidebarWidget):
             pinned_calltree.in_calltree.update_widget(self.cur_func)
             pinned_calltree.out_calltree.update_widget(self.cur_func)
             pinned_calltree.cur_func_layout.binary_view = self.binary_view
+            pinned_calltree.cur_func_layout.cur_func = self.cur_func
 
             max_pinned_name_len = Settings().get_integer("calltree.pin_name_len")
             self.calltree_tab.addTab(
@@ -222,6 +237,7 @@ class CalltreeSidebarWidget(SidebarWidget):
         if self.cur_func is None:
             self.prev_location = None
             self.current_calltree.cur_func_text.setText("None")
+            self.current_calltree.cur_func_layout.cur_func = None
             self.current_calltree.in_calltree.clear()
             self.current_calltree.out_calltree.clear()
             return
@@ -250,6 +266,7 @@ class CalltreeSidebarWidget(SidebarWidget):
             self.current_calltree.cur_func_text.setText(
                 demangle_name(self.binary_view, self.cur_func.name)
             )
+            self.current_calltree.cur_func_layout.cur_func = self.cur_func
             self.current_calltree.in_calltree.update_widget(self.cur_func)
             self.current_calltree.out_calltree.update_widget(self.cur_func)
 

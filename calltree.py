@@ -1,10 +1,12 @@
 import re
+from collections import OrderedDict
 from typing import cast
 from PySide6.QtCore import QSortFilterProxyModel
 from PySide6.QtGui import (
     QStandardItemModel,
     QStandardItem,
     QBrush,
+    QColor,
 )
 from PySide6.QtCore import QSize, Qt
 from PySide6.QtWidgets import QTreeView
@@ -19,7 +21,7 @@ from PySide6.QtWidgets import (
 )
 from binaryninja.settings import Settings
 
-from binaryninja import BinaryView, Function, MediumLevelILOperation, SymbolType, ThemeColor
+from binaryninja import BinaryView, Function, MediumLevelILOperation, SymbolType, ThemeColor, log_info, log_warn
 from binaryninja.types import CoreSymbol
 from binaryninja.enums import SymbolType
 from binaryninjaui import getThemeColor
@@ -37,11 +39,12 @@ class CalltreeWidget(QWidget):
         blacklisted = Settings().get_string_list("calltree.blacklisted")
         hard_blacklist = Settings().get_string_list("calltree.hard_blacklist")
         limit = Settings().get_integer("calltree.limit")
+        sinks = Settings().get_string_list("calltree.sinks")
 
         self.in_calltree = CallTreeLayout("Incoming Calls", in_func_depth, True, \
-                                          blacklisted, hard_blacklist, limit)
+                                          blacklisted, hard_blacklist, limit, sinks)
         self.out_calltree = CallTreeLayout("Outgoing Calls", out_func_depth, False, \
-                                           blacklisted, hard_blacklist, limit)
+                                           blacklisted, hard_blacklist, limit, sinks)
         self.cur_func_layout = CurrentFunctionNameLayout()
 
         self.cur_func_text = self.cur_func_layout.cur_func_text
@@ -56,24 +59,51 @@ class CalltreeWidget(QWidget):
 
 
 class BNFuncItem(QStandardItem):
-    def __init__(self, bv: BinaryView, func: Function):
+    def __init__(self, bv: BinaryView, func: Function | CoreSymbol, sinks: list = None):
         super().__init__()
 
-        if func.symbol.type == SymbolType.FunctionSymbol:
+        symbol = func.symbol if hasattr(func, "symbol") else func
+        if symbol.type == SymbolType.FunctionSymbol:
             self.setForeground(QBrush(getThemeColor(ThemeColor.CodeSymbolColor)))
         else:
             self.setForeground(QBrush(getThemeColor(ThemeColor.ImportColor)))
 
         self.func = func
         self.bv = bv
-        self.setText(demangle_name(self.bv, func.name))
+
+        name = demangle_name(self.bv, func.name)
+        # Append the number of incoming cross-references so that widely-reached
+        # helpers (high blast radius) stand out during triage.
+        addr = getattr(func, "start", None)
+        if addr is None:
+            addr = getattr(func, "address", None)
+        # it's too slow to count xrefs for every node in the tree, so we don't do it anymore
+        #if addr is not None:
+        #    xref_count = len(list(bv.get_code_refs(addr)))
+        #    name = f"{name}  ({xref_count})"
+        # Highlight dangerous sinks (memcpy, system, sprintf, ...) so
+        # memory-safety and injection candidates are obvious in the tree.
+        if sinks and self._is_sink(func.name, sinks):
+            self.setForeground(QBrush(QColor(0xE0, 0x40, 0x40)))
+            font = self.font()
+            font.setBold(True)
+            self.setFont(font)
+        self.setText(name)
         self.setEditable(False)
+
+    @staticmethod
+    def _is_sink(fname: str, sinks: list) -> bool:
+        for p in sinks:
+            if re.search(p, fname):
+                return True
+        return False
 
 
 class CurrentFunctionNameLayout(QHBoxLayout):
     def __init__(self):
         super().__init__()
         self._binary_view = None
+        self._cur_func = None
         self.cur_func_text = QTextEdit()
         self.cur_func_text.setReadOnly(True)
         self.cur_func_text.setMaximumHeight(30)
@@ -91,12 +121,28 @@ class CurrentFunctionNameLayout(QHBoxLayout):
     def binary_view(self, bv):
         self._binary_view = bv
 
-    # TODO: really should check the address as well as name. just going to function name might fail
+    @property
+    def cur_func(self):
+        return self._cur_func
+
+    @cur_func.setter
+    def cur_func(self, func):
+        self._cur_func = func
+
     def goto_func(self, event):
-        # just get the first one
-        cur_func = self._binary_view.get_functions_by_name(
-            self.cur_func_text.toPlainText()
-        )[0]
+        if self._binary_view is None:
+            return
+        # Prefer the cached function object. Looking up by the displayed text is
+        # unreliable because the label shows the demangled name, while
+        # get_functions_by_name expects the raw symbol name.
+        cur_func = self._cur_func
+        if cur_func is None:
+            funcs = self._binary_view.get_functions_by_name(
+                self.cur_func_text.toPlainText()
+            )
+            if not funcs:
+                return
+            cur_func = funcs[0]
         # make sure that sidebar is updated
         if type(cur_func) == CoreSymbol:
             self._binary_view.navigate(self._binary_view.view, cur_func.address)
@@ -137,7 +183,9 @@ class CallTreeUtilLayout(QHBoxLayout):
 
 
 class CallTreeLayout(QVBoxLayout):
-    def __init__(self, label_name: str, depth: int, is_caller: bool, blacklist: list, hard_blacklist: list, limit: int):
+    _CALLEE_CACHE_MAX_ITEMS = 512
+
+    def __init__(self, label_name: str, depth: int, is_caller: bool, blacklist: list, hard_blacklist: list, limit: int, sinks: list = None):
         super().__init__()
         self._cur_func = None
         self._is_caller = is_caller
@@ -145,6 +193,8 @@ class CallTreeLayout(QVBoxLayout):
         self._limit = limit
         self._blacklisted = blacklist
         self._hard_blacklist = hard_blacklist
+        self._sinks = sinks or []
+        self._callee_cache = OrderedDict()
 
         # Creates treeview for all the function calls
         self._treeview = QTreeView()
@@ -205,8 +255,9 @@ class CallTreeLayout(QVBoxLayout):
         return self._binary_view
 
     @binary_view.setter
-    def binary_view(self, bv):
+    def binary_view(self, bv : BinaryView):
         self._binary_view = bv
+        self._callee_cache.clear()
 
     @property
     def func_depth(self):
@@ -238,8 +289,12 @@ class CallTreeLayout(QVBoxLayout):
         self.treeview.collapseAll()
 
     def goto_first_func_use(self, index):
+        if self._binary_view is None:
+            return
         index = self.proxy_model.mapToSource(index)
         item = cast(BNFuncItem, self.model.itemFromIndex(index))
+        if item is None:
+            return
         bv = item.bv
 
         parent_item = cast(BNFuncItem, self.model.itemFromIndex(index.parent()))
@@ -251,6 +306,10 @@ class CallTreeLayout(QVBoxLayout):
             caller, callee = item.func, parent_func
         else:
             caller, callee = parent_func, item.func
+
+        # CoreSymbol nodes (imports/thunks) have no call sites to resolve.
+        if caller is None or type(caller) == CoreSymbol:
+            return
 
         for ref in caller.call_sites:
             if type(callee) == CoreSymbol:
@@ -267,7 +326,12 @@ class CallTreeLayout(QVBoxLayout):
         self._binary_view.navigate(self._binary_view.view, ref.address)
 
     def goto_func(self, index):
-        cur_func = self.model.itemFromIndex(self.proxy_model.mapToSource(index)).func
+        if self._binary_view is None:
+            return
+        item = cast(BNFuncItem, self.model.itemFromIndex(self.proxy_model.mapToSource(index)))
+        if item is None:
+            return
+        cur_func = item.func
         # make sure that sidebar is updated
         self._skip_update = False
         if type(cur_func) == CoreSymbol:
@@ -290,33 +354,108 @@ class CallTreeLayout(QVBoxLayout):
                 return True
         return False
 
+    @staticmethod
+    def _call_sort_key(call):
+        # Functions expose .start; CoreSymbols expose .address. Sort by address
+        # then name so the tree order is stable across refreshes.
+        addr = getattr(call, "start", None)
+        if addr is None:
+            addr = getattr(call, "address", 0)
+        return (addr, call.name)
+
+    def _truncation_item(self):
+        # A non-navigable marker shown when the item/subtree limit is reached so
+        # the user knows results were cut off.
+        item = QStandardItem(f"{self._limit} limit reached")
+        item.setEditable(False)
+        item.setSelectable(False)
+        return item
+
+    @staticmethod
+    def _func_cache_key(func):
+        addr = getattr(func, "start", None)
+        if addr is None:
+            addr = getattr(func, "address", None)
+        if addr is None:
+            # Fallback for unexpected symbols/functions without a stable address.
+            return id(func)
+        return addr
+
+    def get_calls(self, func, is_caller: bool):
+        """Return sorted calls, limited to the configured cap, with truncation state."""
+        # Import/thunk symbols are leaf nodes for call expansion.
+        if type(func) == CoreSymbol:
+            return [], False
+
+        if is_caller:
+            calls = sorted(set(func.callers), key=self._call_sort_key)
+            # TODO: test it it's not too slow
+            code_refs = self._binary_view.get_code_refs(func.start)
+            for code_ref in code_refs:
+                f = self._binary_view.get_functions_containing(code_ref.address)
+                if f:
+                    calls.extend(f)
+
+            if self._limit < 0:
+                return calls, False
+            was_truncated = len(calls) > self._limit
+            return calls[: self._limit], was_truncated
+
+        calls, was_truncated = self.get_callees(func)
+        return calls, was_truncated
+
     def get_callees(self, func):
+        if type(func) == CoreSymbol:
+            return [], False
+
+        cache_key = (self._func_cache_key(func), self._limit)
+        cached = self._callee_cache.get(cache_key)
+        if cached is not None:
+            self._callee_cache.move_to_end(cache_key)
+            return cached
+
+        callees = set()
         for site in func.call_sites:
-            if site.mlil.operation == MediumLevelILOperation.MLIL_CALL:
+            if site.mlil and (site.mlil.operation == MediumLevelILOperation.MLIL_CALL or site.mlil.operation == MediumLevelILOperation.MLIL_TAILCALL):
                 # print(f"site = 0x{site.address:0x}")
                 if site.mlil.dest.operation == MediumLevelILOperation.MLIL_IMPORT:
                     s = self._binary_view.get_symbol_at(site.mlil.dest.value.value)
                     if s:
-                        yield s
+                        callees.add(s)
                 elif site.mlil.dest.operation == MediumLevelILOperation.MLIL_CONST_PTR:
                     f = self._binary_view.get_function_at(site.mlil.dest.value.value)
                     if f:
-                        yield f
+                        callees.add(f)
                     else:
                         # can be a symbol to __builtin_*
                         s = self._binary_view.get_symbol_at(site.mlil.dest.value.value)
                         if s:
-                            yield s
-                elif site.mlil.dest.operation in [MediumLevelILOperation.MLIL_VAR, MediumLevelILOperation.MLIL_LOAD]:
+                            callees.add(s)
+                elif site.mlil.dest.operation in [MediumLevelILOperation.MLIL_VAR, MediumLevelILOperation.MLIL_LOAD, MediumLevelILOperation.MLIL_LOAD_STRUCT]:
                     # addresses from devi
                     code_refs = self._binary_view.get_code_refs_from(site.address)
                     for code_ref in code_refs:
                         # print(hex(code_ref))
                         f =  self._binary_view.get_function_at(code_ref)
                         if f:
-                            yield f
+                            callees.add(f)
+                    else:
+                        if site.mlil.dest.operation == MediumLevelILOperation.MLIL_LOAD_STRUCT: # call from field?
+                            log_warn(f"calltree: MLIL_LOAD_STRUCT call at 0x{site.address:0x} may be a call from a field")
                 else:
-                    print(f"[-] calltree: unknown op at 0x{site.address:0x}")
+                    log_warn(f"calltree: unknown op at 0x{site.address:0x}")
+
+        sorted_callees = sorted(callees, key=self._call_sort_key)
+        if self._limit < 0:
+            result = (sorted_callees, False)
+        else:
+            was_truncated = len(sorted_callees) > self._limit
+            result = (sorted_callees[: self._limit], was_truncated)
+
+        self._callee_cache[cache_key] = result
+        if len(self._callee_cache) > self._CALLEE_CACHE_MAX_ITEMS:
+            self._callee_cache.popitem(last=False)
+        return result
 
     def set_func_calls(self, cur_func, cur_std_item, is_caller: bool, depth=0):
         if type(cur_func) != CoreSymbol:
@@ -332,30 +471,24 @@ class CallTreeLayout(QVBoxLayout):
             return
         if func_symbol.type == SymbolType.LibraryFunctionSymbol:
             return
-        if is_caller:
-            cur_func_calls = list(set(cur_func.callers))
-        else:
-            cur_func_calls = self.get_callees(cur_func)
+        cur_func_calls, was_truncated = self.get_calls(cur_func, is_caller)
 
         if not self.is_hard_blacklisted(cur_func.name):
             if depth < self._func_depth:
                 if cur_func_calls:
-                    count = 0
                     for cur_func_call in cur_func_calls:
-                        new_std_item = BNFuncItem(self._binary_view, cur_func_call)
-                        cur_std_item.appendRow(new_std_item)
-
-                        if count > self._limit:
-                            print("[*] Subtree limit reached for {}".format(cur_func.name))
-                            break
                         if self.is_blacklisted(cur_func_call.name):
                             continue
+                        new_std_item = BNFuncItem(self._binary_view, cur_func_call, self._sinks)
+                        cur_std_item.appendRow(new_std_item)
                         # Dont search on function that calls itself
                         if cur_func != cur_func_call:
                             self.set_func_calls(
                                 cur_func_call, new_std_item, is_caller, depth + 1
                             )
-                            count += 1
+                if was_truncated:
+                    log_info("calltree: subtree limit reached for {}".format(cur_func.name))
+                    cur_std_item.appendRow(self._truncation_item())
 
     def update_widget(self, cur_func: Function):
         if not self.treeview.isVisible():
@@ -367,28 +500,23 @@ class CallTreeLayout(QVBoxLayout):
 
         self.cur_func = cur_func
 
-        if self.is_caller:
-            cur_func_calls = list(set(cur_func.callers))
-        else:
-            cur_func_calls = self.get_callees(cur_func)
+        cur_func_calls, was_truncated = self.get_calls(cur_func, self.is_caller)
 
         root_std_items = []
 
         if not self.is_hard_blacklisted(cur_func.name):
             # Set root std Items
             if cur_func_calls:
-                count = 0
                 for cur_func_call in cur_func_calls:
-                    root_std_items.append(BNFuncItem(self._binary_view, cur_func_call))
+                    root_std_items.append(BNFuncItem(self._binary_view, cur_func_call, self._sinks))
                     cur_std_item = root_std_items[-1]
-                    if count > self._limit:
-                        print("[*] Calltree items limit reached for {}".format(cur_func.name))
-                        break
                     if self.is_blacklisted(cur_func_call.name):
                         continue
                     if cur_func != cur_func_call:
                         self.set_func_calls(cur_func_call, cur_std_item, self.is_caller)
-                        count += 1
+            if was_truncated:
+                log_info("calltree: items limit reached for {}".format(cur_func.name))
+                root_std_items.append(self._truncation_item())
 
         call_root_node.appendRows(root_std_items)
         self.expand_all()
